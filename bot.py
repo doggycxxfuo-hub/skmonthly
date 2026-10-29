@@ -8,10 +8,10 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import psycopg
+from dotenv import load_dotenv
 from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -24,6 +24,11 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
+
+# On your PC: reads the .env file next to bot.py.
+# On Render: there is no .env file, so the Environment Variables you set in the
+# Render dashboard are used (variables already set are never overridden).
+load_dotenv()
 
 # ---------------------------------------------------------------- config
 BOT_TOKEN = os.environ["BOT_TOKEN"]
