@@ -150,6 +150,91 @@ def db_revoke(code: str) -> bool:
 
 
 
+# ======================================================================
+#  MESSAGES (Khmer) - edit any text here, the code below doesn't need to change
+# ======================================================================
+M = {
+    # buttons
+    "btn_account": "👤 គណនី",
+    "btn_activate": "🔑 ធ្វើឱ្យសកម្ម",
+    "btn_admin": "🛠 ផ្ទាំងអ្នកគ្រប់គ្រង",
+    "btn_cancel": "✖ បោះបង់",
+    "btn_back": "⬅ ត្រឡប់ក្រោយ",
+    "btn_gen": "➕ {days} ថ្ងៃ",
+    "btn_codes": "📋 កូដមិនទាន់ប្រើ",
+    "btn_user": "🔍 ពិនិត្យអ្នកប្រើ",
+    "btn_revoke": "🗑 លុបកូដ",
+    # general
+    "welcome": "សូមស្វាគមន៍! សូមជ្រើសរើសជម្រើស៖",
+    "choose": "សូមជ្រើសរើសជម្រើស៖",
+    "cancelled": "បានបោះបង់។",
+    "admins_only": "ពាក្យបញ្ជានេះសម្រាប់តែអ្នកគ្រប់គ្រងប៉ុណ្ណោះ។",
+    "myid": "លេខសម្គាល់ Telegram របស់អ្នក: {id}",
+    # time
+    "expired_word": "ផុតកំណត់ហើយ",
+    "remaining_fmt": "{d} ថ្ងៃ {h} ម៉ោង {m} នាទី",
+    # account
+    "acc_title": "👤 គណនី",
+    "acc_username": "ឈ្មោះអ្នកប្រើ: {v}",
+    "acc_id": "លេខសម្គាល់អ្នកប្រើ (ID): {v}",
+    "acc_not_active": "ស្ថានភាព: មិនទាន់ធ្វើឱ្យសកម្ម",
+    "acc_expired": "ស្ថានភាព: ផុតកំណត់",
+    "acc_expired_on": "ផុតកំណត់នៅ: {v}",
+    "acc_active": "ស្ថានភាព: សកម្ម",
+    "acc_expires": "ផុតកំណត់: {v}",
+    "acc_remaining": "ពេលវេលានៅសល់: {v}",
+    # activation
+    "ask_code": "សូមផ្ញើកូដធ្វើឱ្យសកម្មរបស់អ្នកឥឡូវនេះ។\nឧទាហរណ៍: SK-XXXX-XXXX-XXXX",
+    "retry_code": "\nសូមផ្ញើកូដម្ដងទៀត ឬចុចបោះបង់។",
+    "bad_code": "កូដមិនត្រឹមត្រូវ ឬត្រូវបានប្រើរួចហើយ។",
+    "activated": "✅ ធ្វើឱ្យសកម្មបានជោគជ័យ! បន្ថែម {days} ថ្ងៃ។",
+    "redeem_usage": "របៀបប្រើ: /redeem SK-XXXX-XXXX-XXXX",
+    "need_activation": (
+        "សិទ្ធិរបស់អ្នកបានផុតកំណត់ ឬមិនទាន់ធ្វើឱ្យសកម្ម។\n"
+        "ប្រើ /redeem កូដរបស់អ្នក ដើម្បីធ្វើឱ្យសកម្ម។"
+    ),
+    "status_none": "មិនទាន់ធ្វើឱ្យសកម្ម។ ប្រើ /redeem កូដរបស់អ្នក",
+    "status_expired": (
+        "សិទ្ធិរបស់អ្នកបានផុតកំណត់នៅ {date}។\n"
+        "សូមស្នើសុំកូដថ្មីពីអ្នកគ្រប់គ្រង រួចប្រើ /redeem។"
+    ),
+    "status_active": "សកម្ម\nផុតកំណត់: {date}\nពេលវេលានៅសល់: {left}",
+    "vip_ok": "អ្នកមានការជាវសកម្ម។ សូមស្វាគមន៍!",
+    # admin panel
+    "panel": (
+        "🛠 ផ្ទាំងអ្នកគ្រប់គ្រង\n"
+        "អ្នកប្រើសកម្ម: {active}\n"
+        "អ្នកប្រើសរុប: {total}\n"
+        "កូដមិនទាន់ប្រើ: {unused}\n\n"
+        "សូមជ្រើសរើសសកម្មភាព៖"
+    ),
+    "gen_one": (
+        "កូដថ្មី {days} ថ្ងៃ:\n\n<code>{code}</code>\n\n"
+        "ចុចលើកូដដើម្បីចម្លង រួចផ្ញើទៅអ្នកប្រើ។"
+    ),
+    "gen_many": (
+        "បានបង្កើតកូដចំនួន {count} (មួយកូដ {days} ថ្ងៃ):\n\n{body}\n\n"
+        "ចុចលើកូដដើម្បីចម្លង រួចផ្ញើទៅអ្នកប្រើ។"
+    ),
+    "gen_usage": "របៀបប្រើ: /gen [ចំនួនថ្ងៃ] [ចំនួនកូដ]",
+    "gen_range": "ចំនួនថ្ងៃត្រូវតែពី 1 ដល់ 3650 និងចំនួនកូដពី 1 ដល់ 20។",
+    "no_codes": "គ្មានកូដដែលមិនទាន់ប្រើទេ។",
+    "codes_list": "កូដមិនទាន់ប្រើ ({n}):\n\n{body}",
+    "ask_user": "សូមផ្ញើលេខសម្គាល់ Telegram ឬ @username របស់អ្នកប្រើ។",
+    "ask_revoke": "សូមផ្ញើកូដដែលអ្នកចង់លុប (SK-XXXX-XXXX-XXXX)។",
+    "user_not_found": "រកមិនឃើញអ្នកប្រើទេ។ សូមផ្ញើ ID / @username ផ្សេង ឬចុចបោះបង់។",
+    "user_info": "👤 អ្នកប្រើ\nID: {id}\nឈ្មោះអ្នកប្រើ: {name}\n{state}",
+    "user_state_active": "សកម្ម\nផុតកំណត់: {date}\nនៅសល់: {left}",
+    "user_state_expired": "ផុតកំណត់នៅ {date}",
+    "revoked": "បានលុបកូដរួចរាល់។",
+    "revoke_fail": "រកមិនឃើញកូដ ឬកូដត្រូវបានប្រើរួចហើយ។",
+    "revoke_usage": "របៀបប្រើ: /revoke SK-XXXX-XXXX-XXXX",
+    "user_usage": "របៀបប្រើ: /user TELEGRAM_ID",
+    "user_never": "អ្នកប្រើនេះមិនទាន់ធ្វើឱ្យសកម្មកូដណាមួយទេ។",
+    "user_cmd_info": "ផុតកំណត់: {date}\nនៅសល់: {left}",
+}
+
+
 def db_stats():
     now = datetime.now(timezone.utc)
     with connect() as conn:
@@ -179,11 +264,9 @@ def db_find_user(query: str):
 def fmt_remaining(expiry: datetime) -> str:
     delta = expiry - datetime.now(timezone.utc)
     if delta.total_seconds() <= 0:
-        return "expired"
-    days = delta.days
+        return M["expired_word"]
     hours, rem = divmod(delta.seconds, 3600)
-    minutes = rem // 60
-    return f"{days}d {hours}h {minutes}m"
+    return M["remaining_fmt"].format(d=delta.days, h=hours, m=rem // 60)
 
 
 def fmt_date(dt: datetime) -> str:
@@ -194,7 +277,7 @@ def admin_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("This command is for admins only.")
+            await update.message.reply_text(M["admins_only"])
             return
         return await func(update, context)
 
@@ -208,10 +291,7 @@ def active_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry = await asyncio.to_thread(db_get_expiry, update.effective_user.id)
         if not expiry or expiry <= datetime.now(timezone.utc):
-            await update.message.reply_text(
-                "Your access has expired or is not activated.\n"
-                "Use /redeem YOUR-CODE to activate."
-            )
+            await update.message.reply_text(M["need_activation"])
             return
         return await func(update, context)
 
@@ -222,12 +302,12 @@ def active_only(func):
 def main_menu(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("👤 Account", callback_data="account"),
-            InlineKeyboardButton("🔑 Activate", callback_data="activate"),
+            InlineKeyboardButton(M["btn_account"], callback_data="account"),
+            InlineKeyboardButton(M["btn_activate"], callback_data="activate"),
         ]
     ]
     if user_id in ADMIN_IDS:
-        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin")])
+        rows.append([InlineKeyboardButton(M["btn_admin"], callback_data="admin")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -235,23 +315,22 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("➕ 7 days", callback_data="adm_gen_7"),
-                InlineKeyboardButton("➕ 30 days", callback_data="adm_gen_30"),
-                InlineKeyboardButton("➕ 90 days", callback_data="adm_gen_90"),
+                InlineKeyboardButton(M["btn_gen"].format(days=d), callback_data=f"adm_gen_{d}")
+                for d in (7, 30, 90)
             ],
             [
-                InlineKeyboardButton("📋 Unused codes", callback_data="adm_codes"),
-                InlineKeyboardButton("🔍 Check user", callback_data="adm_user"),
+                InlineKeyboardButton(M["btn_codes"], callback_data="adm_codes"),
+                InlineKeyboardButton(M["btn_user"], callback_data="adm_user"),
             ],
-            [InlineKeyboardButton("🗑 Revoke code", callback_data="adm_revoke")],
-            [InlineKeyboardButton("⬅ Back", callback_data="back")],
+            [InlineKeyboardButton(M["btn_revoke"], callback_data="adm_revoke")],
+            [InlineKeyboardButton(M["btn_back"], callback_data="back")],
         ]
     )
 
 
 def cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✖ Cancel", callback_data="cancel")]]
+        [[InlineKeyboardButton(M["btn_cancel"], callback_data="cancel")]]
     )
 
 
@@ -262,28 +341,26 @@ def clear_pending(context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_panel_text() -> str:
     active, total, unused = await asyncio.to_thread(db_stats)
-    return (
-        "🛠 Admin Panel\n"
-        f"Active users: {active}\n"
-        f"Total users: {total}\n"
-        f"Unused codes: {unused}\n\n"
-        "Pick an action:"
-    )
+    return M["panel"].format(active=active, total=total, unused=unused)
 
 
 async def account_text(user) -> str:
     expiry = await asyncio.to_thread(db_get_expiry, user.id)
     name = f"@{user.username}" if user.username else (user.full_name or "-")
-    lines = ["👤 Account", f"Username: {name}", f"User ID: {user.id}"]
+    lines = [
+        M["acc_title"],
+        M["acc_username"].format(v=name),
+        M["acc_id"].format(v=user.id),
+    ]
     if not expiry:
-        lines.append("Status: not activated")
+        lines.append(M["acc_not_active"])
     elif expiry <= datetime.now(timezone.utc):
-        lines += ["Status: expired", f"Expired on: {fmt_date(expiry)}"]
+        lines += [M["acc_expired"], M["acc_expired_on"].format(v=fmt_date(expiry))]
     else:
         lines += [
-            "Status: active",
-            f"Expires: {fmt_date(expiry)}",
-            f"Remaining: {fmt_remaining(expiry)}",
+            M["acc_active"],
+            M["acc_expires"].format(v=fmt_date(expiry)),
+            M["acc_remaining"].format(v=fmt_remaining(expiry)),
         ]
     return "\n".join(lines)
 
@@ -292,32 +369,33 @@ async def do_redeem(code: str, user) -> tuple[str, bool]:
     """Shared by /redeem and the Activate button. Returns (message, success)."""
     result = await asyncio.to_thread(db_redeem, code, user.id, user.username)
     if result is None:
-        return "Invalid or already used code.", False
+        return M["bad_code"], False
     days, expiry = result
-    return (
-        f"✅ Activated! +{days} days.\n"
-        f"Expires: {fmt_date(expiry)}\n"
-        f"Remaining: {fmt_remaining(expiry)}",
-        True,
+    text = "\n".join(
+        [
+            M["activated"].format(days=days),
+            M["acc_expires"].format(v=fmt_date(expiry)),
+            M["acc_remaining"].format(v=fmt_remaining(expiry)),
+        ]
     )
+    return text, True
 
 
 # --------------------------------------------------------- user commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_pending(context)
     await update.message.reply_text(
-        "Welcome! Choose an option:",
-        reply_markup=main_menu(update.effective_user.id),
+        M["welcome"], reply_markup=main_menu(update.effective_user.id)
     )
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Your Telegram ID: {update.effective_user.id}")
+    await update.message.reply_text(M["myid"].format(id=update.effective_user.id))
 
 
 async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /redeem SK-XXXX-XXXX-XXXX")
+        await update.message.reply_text(M["redeem_usage"])
         return
     code = context.args[0].strip().upper()
     message, _ = await do_redeem(code, update.effective_user)
@@ -329,23 +407,22 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expiry = await asyncio.to_thread(db_get_expiry, update.effective_user.id)
     if not expiry:
-        await update.message.reply_text("Not activated. Use /redeem YOUR-CODE")
+        await update.message.reply_text(M["status_none"])
         return
     if expiry <= datetime.now(timezone.utc):
         await update.message.reply_text(
-            f"Your access expired on {fmt_date(expiry)}.\n"
-            "Ask the admin for a new code, then use /redeem."
+            M["status_expired"].format(date=fmt_date(expiry))
         )
         return
     await update.message.reply_text(
-        f"Active\nExpires: {fmt_date(expiry)}\nTime left: {fmt_remaining(expiry)}"
+        M["status_active"].format(date=fmt_date(expiry), left=fmt_remaining(expiry))
     )
 
 
 @active_only
 async def vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # example of a protected command - replace with your real feature
-    await update.message.reply_text("You have an active subscription. Welcome in!")
+    await update.message.reply_text(M["vip_ok"])
 
 
 # -------------------------------------------------------- button handling
@@ -359,7 +436,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- admin buttons (always re-check the user is an admin)
     if data == "admin" or data.startswith("adm_"):
         if user.id not in ADMIN_IDS:
-            await msg.reply_text("Admins only.")
+            await msg.reply_text(M["admins_only"])
             return
         clear_pending(context)
 
@@ -370,8 +447,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days = int(data.rsplit("_", 1)[1])
             codes = await asyncio.to_thread(db_generate, user.id, days, 1)
             await msg.reply_text(
-                f"New {days}-day code:\n\n<code>{codes[0]}</code>\n\n"
-                "Tap the code to copy it, then send it to the user.",
+                M["gen_one"].format(days=days, code=codes[0]),
                 parse_mode=ParseMode.HTML,
                 reply_markup=admin_menu(),
             )
@@ -379,25 +455,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "adm_codes":
             rows = await asyncio.to_thread(db_unused_codes)
             if not rows:
-                text, mode = "No unused codes.", None
+                text, mode = M["no_codes"], None
             else:
-                body = "\n".join(f"<code>{c}</code> ({d}d)" for c, d in rows)
-                text, mode = f"Unused codes ({len(rows)}):\n\n{body}", ParseMode.HTML
+                body = "\n".join(f"<code>{c}</code> ({d} ថ្ងៃ)" for c, d in rows)
+                text = M["codes_list"].format(n=len(rows), body=body)
+                mode = ParseMode.HTML
             await msg.reply_text(text, parse_mode=mode, reply_markup=admin_menu())
 
         elif data == "adm_user":
             context.user_data["admin_action"] = "check_user"
-            await msg.reply_text(
-                "Send the user's Telegram ID or @username.",
-                reply_markup=cancel_menu(),
-            )
+            await msg.reply_text(M["ask_user"], reply_markup=cancel_menu())
 
         elif data == "adm_revoke":
             context.user_data["admin_action"] = "revoke"
-            await msg.reply_text(
-                "Send the code you want to revoke (SK-XXXX-XXXX-XXXX).",
-                reply_markup=cancel_menu(),
-            )
+            await msg.reply_text(M["ask_revoke"], reply_markup=cancel_menu())
         return
 
     # ---- normal user buttons
@@ -407,16 +478,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "activate":
         clear_pending(context)
         context.user_data["awaiting_code"] = True
-        await msg.reply_text(
-            "Please send your activation code now.\nExample: SK-XXXX-XXXX-XXXX",
-            reply_markup=cancel_menu(),
-        )
+        await msg.reply_text(M["ask_code"], reply_markup=cancel_menu())
     elif data == "back":
         clear_pending(context)
-        await msg.reply_text("Choose an option:", reply_markup=main_menu(user.id))
+        await msg.reply_text(M["choose"], reply_markup=main_menu(user.id))
     elif data == "cancel":
         clear_pending(context)
-        await msg.reply_text("Cancelled.", reply_markup=main_menu(user.id))
+        await msg.reply_text(M["cancelled"], reply_markup=main_menu(user.id))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -431,27 +499,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = await asyncio.to_thread(db_find_user, text)
             if not row:
                 await update.message.reply_text(
-                    "No user found. Send another ID / @username, or press Cancel.",
-                    reply_markup=cancel_menu(),
+                    M["user_not_found"], reply_markup=cancel_menu()
                 )
                 return
             uid, uname, expiry = row
-            state = (
-                f"Active\nExpires: {fmt_date(expiry)}\nRemaining: {fmt_remaining(expiry)}"
-                if expiry > datetime.now(timezone.utc)
-                else f"Expired on {fmt_date(expiry)}"
-            )
+            if expiry > datetime.now(timezone.utc):
+                state = M["user_state_active"].format(
+                    date=fmt_date(expiry), left=fmt_remaining(expiry)
+                )
+            else:
+                state = M["user_state_expired"].format(date=fmt_date(expiry))
             clear_pending(context)
             await update.message.reply_text(
-                f"👤 User\nID: {uid}\nUsername: {'@' + uname if uname else '-'}\n{state}",
+                M["user_info"].format(
+                    id=uid, name=("@" + uname) if uname else "-", state=state
+                ),
                 reply_markup=admin_menu(),
             )
         elif action == "revoke":
             ok = await asyncio.to_thread(db_revoke, text.upper())
             clear_pending(context)
             await update.message.reply_text(
-                "Code revoked." if ok else "Code not found or already used.",
-                reply_markup=admin_menu(),
+                M["revoked"] if ok else M["revoke_fail"], reply_markup=admin_menu()
             )
         return
 
@@ -463,8 +532,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(message, reply_markup=main_menu(user.id))
         else:
             await update.message.reply_text(
-                message + "\nSend the code again, or press Cancel.",
-                reply_markup=cancel_menu(),
+                message + M["retry_code"], reply_markup=cancel_menu()
             )
 
 
@@ -481,16 +549,15 @@ async def gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = int(context.args[0]) if len(context.args) > 0 else DEFAULT_DAYS
         count = int(context.args[1]) if len(context.args) > 1 else 1
     except ValueError:
-        await update.message.reply_text("Usage: /gen [days] [count]")
+        await update.message.reply_text(M["gen_usage"])
         return
     if not (1 <= days <= 3650 and 1 <= count <= 20):
-        await update.message.reply_text("days must be 1-3650 and count 1-20.")
+        await update.message.reply_text(M["gen_range"])
         return
     codes = await asyncio.to_thread(db_generate, update.effective_user.id, days, count)
     body = "\n".join(f"<code>{c}</code>" for c in codes)
     await update.message.reply_text(
-        f"Generated {count} code(s), {days} days each:\n\n{body}\n\n"
-        "Tap a code to copy it, then send it to the user.",
+        M["gen_many"].format(count=count, days=days, body=body),
         parse_mode=ParseMode.HTML,
     )
 
@@ -499,37 +566,35 @@ async def gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def codes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(db_unused_codes)
     if not rows:
-        await update.message.reply_text("No unused codes.")
+        await update.message.reply_text(M["no_codes"])
         return
-    body = "\n".join(f"<code>{c}</code> ({d}d)" for c, d in rows)
+    body = "\n".join(f"<code>{c}</code> ({d} ថ្ងៃ)" for c, d in rows)
     await update.message.reply_text(
-        f"Unused codes ({len(rows)}):\n\n{body}", parse_mode=ParseMode.HTML
+        M["codes_list"].format(n=len(rows), body=body), parse_mode=ParseMode.HTML
     )
 
 
 @admin_only
 async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /revoke SK-XXXX-XXXX-XXXX")
+        await update.message.reply_text(M["revoke_usage"])
         return
     ok = await asyncio.to_thread(db_revoke, context.args[0].strip().upper())
-    await update.message.reply_text(
-        "Code revoked." if ok else "Code not found or already used."
-    )
+    await update.message.reply_text(M["revoked"] if ok else M["revoke_fail"])
 
 
 @admin_only
 async def user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/user 123456789 - check someone's expiry"""
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /user TELEGRAM_ID")
+        await update.message.reply_text(M["user_usage"])
         return
     expiry = await asyncio.to_thread(db_get_expiry, int(context.args[0]))
     if not expiry:
-        await update.message.reply_text("That user has never activated a code.")
+        await update.message.reply_text(M["user_never"])
         return
     await update.message.reply_text(
-        f"Expires: {fmt_date(expiry)}\nTime left: {fmt_remaining(expiry)}"
+        M["user_cmd_info"].format(date=fmt_date(expiry), left=fmt_remaining(expiry))
     )
 
 
