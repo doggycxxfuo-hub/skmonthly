@@ -11,6 +11,8 @@ import psycopg
 from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -493,7 +495,13 @@ def cancel_menu() -> InlineKeyboardMarkup:
 
 
 def clear_pending(context: ContextTypes.DEFAULT_TYPE):
-    for key in ("awaiting_code", "admin_action", "new_acc_username"):
+    for key in (
+        "awaiting_code",
+        "admin_action",
+        "new_acc_username",
+        "prompt_id",
+        "tries",
+    ):
         context.user_data.pop(key, None)
 
 
@@ -546,13 +554,42 @@ async def do_redeem(code: str, user) -> tuple[str, bool]:
     return "\n".join(lines), True
 
 
+# ------------------------------------------------ in-place message updates
+async def render(bot, chat_id, message_id, text, markup=None, mode=None) -> int:
+    """Edit the bot's existing message in place so the chat doesn't fill up.
+    Falls back to sending a new message if the old one can't be edited.
+    Returns the id of the message that now shows the text."""
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=markup,
+                parse_mode=mode,
+            )
+            return message_id
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return message_id  # same content, nothing to do
+            log.warning("edit failed, sending a new message instead: %s", e)
+    sent = await bot.send_message(
+        chat_id, text, reply_markup=markup, parse_mode=mode
+    )
+    return sent.message_id
+
+
+def fail_mark(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """' (2)', ' (3)'... so repeated identical errors still visibly change."""
+    n = context.user_data["tries"] = context.user_data.get("tries", 0) + 1
+    return f" ({n})" if n > 1 else ""
+
+
 # ---------------------------------------------------- admin account screens
-async def show_account_list(bot, chat_id: int):
+async def show_account_list(bot, chat_id: int, message_id: int | None):
     rows = await asyncio.to_thread(db_list_accounts)
     if not rows:
-        await bot.send_message(
-            chat_id, M["acc_list_empty"], reply_markup=admin_menu()
-        )
+        await render(bot, chat_id, message_id, M["acc_list_empty"], admin_menu())
         return
     buttons = [
         [
@@ -569,29 +606,33 @@ async def show_account_list(bot, chat_id: int):
             InlineKeyboardButton(M["btn_back"], callback_data="admin"),
         ]
     )
-    await bot.send_message(
+    await render(
+        bot,
         chat_id,
+        message_id,
         M["acc_list_title"].format(n=len(rows)),
-        reply_markup=InlineKeyboardMarkup(buttons),
+        InlineKeyboardMarkup(buttons),
     )
 
 
-async def show_account(bot, chat_id: int, acc_id: int, prefix: str = ""):
+async def show_account(
+    bot, chat_id: int, message_id: int | None, acc_id: int, prefix: str = ""
+):
     acc = await asyncio.to_thread(db_get_account, acc_id)
     if not acc:
-        await bot.send_message(
-            chat_id, M["acc_not_found"], reply_markup=admin_menu()
-        )
+        await render(bot, chat_id, message_id, M["acc_not_found"], admin_menu())
         return
     _, username, password, unused, used = acc
-    await bot.send_message(
+    await render(
+        bot,
         chat_id,
+        message_id,
         prefix
         + M["acc_detail"].format(
             u=esc(username), p=esc(password), unused=unused, used=used
         ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=account_menu(acc_id),
+        account_menu(acc_id),
+        ParseMode.HTML,
     )
 
 
@@ -648,76 +689,82 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     data = query.data
     msg = query.message
-    bot = context.bot
-    chat_id = msg.chat_id
+    bot, chat_id, mid = context.bot, msg.chat_id, msg.message_id
+
+    async def show(text, markup=None, mode=None):
+        """Replace the text of the message that holds the pressed button."""
+        return await render(bot, chat_id, mid, text, markup, mode)
 
     # ---- admin buttons (always re-check the user is an admin)
     if data == "admin" or data.startswith(("adm_", "ax_")):
         if user.id not in ADMIN_IDS:
-            await msg.reply_text(M["admins_only"])
+            await show(M["admins_only"], main_menu(user.id))
             return
         clear_pending(context)
 
         if data == "admin":
-            await msg.reply_text(await admin_panel_text(), reply_markup=admin_menu())
+            await show(await admin_panel_text(), admin_menu())
 
         elif data == "adm_codes":
             rows = await asyncio.to_thread(db_unused_codes)
             if not rows:
-                text, mode = M["no_codes"], None
+                await show(M["no_codes"], admin_menu())
             else:
                 body = "\n".join(
                     f"<code>{c}</code> ({d} ថ្ងៃ{' · ' + esc(a) if a else ''})"
                     for c, d, a in rows
                 )
-                text = M["codes_list"].format(n=len(rows), body=body)
-                mode = ParseMode.HTML
-            await msg.reply_text(text, parse_mode=mode, reply_markup=admin_menu())
+                await show(
+                    M["codes_list"].format(n=len(rows), body=body),
+                    admin_menu(),
+                    ParseMode.HTML,
+                )
 
         elif data == "adm_user":
             context.user_data["admin_action"] = "check_user"
-            await msg.reply_text(M["ask_user"], reply_markup=cancel_menu())
+            context.user_data["prompt_id"] = mid
+            await show(M["ask_user"], cancel_menu())
 
         elif data == "adm_revoke":
             context.user_data["admin_action"] = "revoke"
-            await msg.reply_text(M["ask_revoke"], reply_markup=cancel_menu())
+            context.user_data["prompt_id"] = mid
+            await show(M["ask_revoke"], cancel_menu())
 
         elif data == "ax_add":
             context.user_data["admin_action"] = "acc_username"
-            await msg.reply_text(M["ask_acc_username"], reply_markup=cancel_menu())
+            context.user_data["prompt_id"] = mid
+            await show(M["ask_acc_username"], cancel_menu())
 
         elif data == "ax_list":
-            await show_account_list(bot, chat_id)
+            await show_account_list(bot, chat_id, mid)
 
         elif data.startswith("ax_open_"):
-            await show_account(bot, chat_id, int(data.rsplit("_", 1)[1]))
+            await show_account(bot, chat_id, mid, int(data.rsplit("_", 1)[1]))
 
         elif data.startswith("ax_gen_"):
             _, _, acc_id, days = data.split("_")
             acc_id, days = int(acc_id), int(days)
             acc = await asyncio.to_thread(db_get_account, acc_id)
             if not acc:
-                await msg.reply_text(M["acc_not_found"], reply_markup=admin_menu())
+                await show(M["acc_not_found"], admin_menu())
                 return
             codes = await asyncio.to_thread(db_generate, user.id, days, 1, acc_id)
-            await msg.reply_text(
-                M["gen_for_account"].format(
-                    days=days, u=esc(acc[1]), code=codes[0]
-                ),
+            # a NEW message on purpose: every generated code stays in the chat
+            await bot.send_message(
+                chat_id,
+                M["gen_for_account"].format(days=days, u=esc(acc[1]), code=codes[0]),
                 parse_mode=ParseMode.HTML,
-                reply_markup=account_menu(acc_id),
             )
 
         elif data.startswith("ax_del_"):
             acc_id = int(data.rsplit("_", 1)[1])
             acc = await asyncio.to_thread(db_get_account, acc_id)
             if not acc:
-                await msg.reply_text(M["acc_not_found"], reply_markup=admin_menu())
+                await show(M["acc_not_found"], admin_menu())
                 return
-            await msg.reply_text(
+            await show(
                 M["acc_confirm_delete"].format(u=esc(acc[1])),
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -729,85 +776,96 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ]
                     ]
                 ),
+                ParseMode.HTML,
             )
 
         elif data.startswith("ax_delok_"):
             acc_id = int(data.rsplit("_", 1)[1])
             ok = await asyncio.to_thread(db_delete_account, acc_id)
-            await msg.reply_text(
-                M["acc_deleted"] if ok else M["acc_not_found"],
-                reply_markup=admin_menu(),
+            await show(
+                M["acc_deleted"] if ok else M["acc_not_found"], admin_menu()
             )
         return
 
     # ---- normal user buttons
     if data == "account":
         clear_pending(context)
-        await msg.reply_text(
-            await account_text(user),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(user.id),
-        )
+        await show(await account_text(user), main_menu(user.id), ParseMode.HTML)
     elif data == "activate":
         clear_pending(context)
         context.user_data["awaiting_code"] = True
-        await msg.reply_text(M["ask_code"], reply_markup=cancel_menu())
+        context.user_data["prompt_id"] = mid
+        await show(M["ask_code"], cancel_menu())
     elif data == "back":
         clear_pending(context)
-        await msg.reply_text(M["choose"], reply_markup=main_menu(user.id))
+        await show(M["choose"], main_menu(user.id))
     elif data == "cancel":
         clear_pending(context)
-        await msg.reply_text(M["cancelled"], reply_markup=main_menu(user.id))
+        await show(M["cancelled"], main_menu(user.id))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles text sent after pressing Activate or an admin input button."""
     user = update.effective_user
     text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    ud = context.user_data
+
+    action = ud.get("admin_action") if user.id in ADMIN_IDS else None
+    awaiting = ud.get("awaiting_code")
+    if not action and not awaiting:
+        return  # not waiting for anything: ignore ordinary chat text
+
+    prompt_id = ud.get("prompt_id")
+
+    # keep the chat tidy: remove what the user just typed (code / password / ID)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    async def show(t, markup=None, mode=None):
+        """Show the answer inside the bot's prompt message (edited in place)."""
+        return await render(context.bot, chat_id, prompt_id, t, markup, mode)
 
     # ---- admin inputs
-    action = context.user_data.get("admin_action")
-    if action and user.id in ADMIN_IDS:
+    if action:
         if action in ("acc_username", "acc_password"):
             if not text:
-                await update.message.reply_text(
-                    M["acc_empty_input"], reply_markup=cancel_menu()
+                ud["prompt_id"] = await show(
+                    M["acc_empty_input"] + fail_mark(context), cancel_menu()
                 )
                 return
             if len(text) > MAX_FIELD_LEN:
-                await update.message.reply_text(
-                    M["acc_too_long"], reply_markup=cancel_menu()
+                ud["prompt_id"] = await show(
+                    M["acc_too_long"] + fail_mark(context), cancel_menu()
                 )
                 return
 
             if action == "acc_username":
-                context.user_data["new_acc_username"] = text
-                context.user_data["admin_action"] = "acc_password"
-                await update.message.reply_text(
-                    M["ask_acc_password"], reply_markup=cancel_menu()
-                )
+                ud.pop("tries", None)
+                ud["new_acc_username"] = text
+                ud["admin_action"] = "acc_password"
+                ud["prompt_id"] = await show(M["ask_acc_password"], cancel_menu())
                 return
 
             # action == "acc_password"
-            username = context.user_data.get("new_acc_username")
-            chat_id = update.effective_chat.id
+            username = ud.get("new_acc_username")
             clear_pending(context)
             if not username:
-                await update.message.reply_text(M["cancelled"], reply_markup=admin_menu())
+                await show(M["cancelled"], admin_menu())
                 return
             acc_id = await asyncio.to_thread(db_add_account, username, text)
-            try:  # remove the message that contains the password from the chat
-                await update.message.delete()
-            except Exception:
-                pass
-            await show_account(context.bot, chat_id, acc_id, prefix=M["acc_created"])
+            await show_account(
+                context.bot, chat_id, prompt_id, acc_id, prefix=M["acc_created"]
+            )
             return
 
         if action == "check_user":
             row = await asyncio.to_thread(db_find_user, text)
             if not row:
-                await update.message.reply_text(
-                    M["user_not_found"], reply_markup=cancel_menu()
+                ud["prompt_id"] = await show(
+                    M["user_not_found"] + fail_mark(context), cancel_menu()
                 )
                 return
             uid, uname, expiry = row
@@ -818,32 +876,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 state = M["user_state_expired"].format(date=fmt_date(expiry))
             clear_pending(context)
-            await update.message.reply_text(
+            await show(
                 M["user_info"].format(
                     id=uid, name=("@" + uname) if uname else "-", state=state
                 ),
-                reply_markup=admin_menu(),
+                admin_menu(),
             )
         elif action == "revoke":
             ok = await asyncio.to_thread(db_revoke, text.upper())
             clear_pending(context)
-            await update.message.reply_text(
-                M["revoked"] if ok else M["revoke_fail"], reply_markup=admin_menu()
-            )
+            await show(M["revoked"] if ok else M["revoke_fail"], admin_menu())
         return
 
     # ---- activation code
-    if context.user_data.get("awaiting_code"):
-        message, ok = await do_redeem(text.upper(), user)
-        if ok:
-            clear_pending(context)
-            await update.message.reply_text(
-                message, parse_mode=ParseMode.HTML, reply_markup=main_menu(user.id)
-            )
-        else:
-            await update.message.reply_text(
-                message + M["retry_code"], reply_markup=cancel_menu()
-            )
+    message, ok = await do_redeem(text.upper(), user)
+    if ok:
+        clear_pending(context)
+        await show(message, main_menu(user.id), ParseMode.HTML)
+    else:
+        ud["prompt_id"] = await show(
+            message + fail_mark(context) + M["retry_code"], cancel_menu()
+        )
 
 
 # -------------------------------------------------------- admin commands
