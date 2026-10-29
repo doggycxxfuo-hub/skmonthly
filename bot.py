@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -23,6 +23,10 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO level, and Telegram's URL contains the
+# bot token. Keep these loggers quiet so the token never shows up in logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 # On your PC: reads the .env file next to bot.py.
@@ -109,6 +113,7 @@ def init_db():
             """
         )
         conn.execute("ALTER TABLE codes ADD COLUMN IF NOT EXISTS account_id INTEGER")
+        conn.execute("ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS code TEXT")
 
 
 def new_code() -> str:
@@ -167,9 +172,10 @@ def db_redeem(code: str, user_id: int, username: str | None):
             ).fetchone()
             if acc:
                 conn.execute(
-                    "INSERT INTO user_accounts (user_id, username, password, redeemed_at) "
-                    "VALUES (%s, %s, %s, %s)",
-                    (user_id, acc[0], acc[1], now),
+                    "INSERT INTO user_accounts "
+                    "(user_id, username, password, redeemed_at, code) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (user_id, acc[0], acc[1], now, code),
                 )
                 creds = (acc[0], acc[1])
     return days, new_expiry, creds
@@ -202,12 +208,147 @@ def db_unused_codes(limit: int = 50):
         ).fetchall()
 
 
-def db_revoke(code: str) -> bool:
+# ---- codes & users lists (admin)
+CODE_FILTERS = {
+    "a": "",
+    "u": "WHERE c.redeemed_by IS NULL",
+    "r": "WHERE c.redeemed_by IS NOT NULL",
+}
+
+
+def _filter(f: str) -> str:
+    return f if f in CODE_FILTERS else "a"
+
+
+def db_count_codes(f: str = "a") -> int:
+    with connect() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) FROM codes c {CODE_FILTERS[_filter(f)]}"
+        ).fetchone()[0]
+
+
+def db_list_codes(f: str, limit: int, offset: int):
+    """(code, days, redeemed_by, account_username) newest first - ALL codes."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT c.code, c.days, c.redeemed_by, a.username FROM codes c "
+            "LEFT JOIN accounts a ON a.id = c.account_id "
+            f"{CODE_FILTERS[_filter(f)]} "
+            "ORDER BY c.created_at DESC, c.code LIMIT %s OFFSET %s",
+            (limit, offset),
+        ).fetchall()
+
+
+def db_get_code(code: str):
+    """(code, days, created_at, redeemed_by, redeemed_at, account_name, user_name)"""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT c.code, c.days, c.created_at, c.redeemed_by, c.redeemed_at, "
+            "a.username, u.username FROM codes c "
+            "LEFT JOIN accounts a ON a.id = c.account_id "
+            "LEFT JOIN users u ON u.user_id = c.redeemed_by "
+            "WHERE c.code = %s",
+            (code,),
+        ).fetchone()
+
+
+def db_delete_code(code: str) -> bool:
+    """Deletes ANY code (unused or already used). A user's access time is kept."""
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM codes WHERE code = %s", (code,))
+        return cur.rowcount > 0
+
+
+def db_clean_used() -> int:
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM codes WHERE redeemed_by IS NOT NULL")
+        return cur.rowcount
+
+
+def db_delete_code_and_revoke(code: str) -> bool:
+    """Deletes the code AND takes its days (and the username/password it gave)
+    away from the user who redeemed it."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT days, redeemed_by, account_id FROM codes WHERE code = %s", (code,)
+        ).fetchone()
+        if not row:
+            return False
+        days, uid, account_id = row
+        conn.execute("DELETE FROM codes WHERE code = %s", (code,))
+        if uid is not None:
+            cur = conn.execute(
+                "SELECT expires_at FROM users WHERE user_id = %s", (uid,)
+            ).fetchone()
+            if cur:
+                conn.execute(
+                    "UPDATE users SET expires_at = %s WHERE user_id = %s",
+                    (cur[0] - timedelta(days=days), uid),
+                )
+            removed = conn.execute(
+                "DELETE FROM user_accounts WHERE code = %s", (code,)
+            ).rowcount
+            if removed == 0 and account_id is not None:
+                # credentials given before the bot remembered the code
+                conn.execute(
+                    "DELETE FROM user_accounts WHERE id = (SELECT id FROM user_accounts "
+                    "WHERE user_id = %s AND code IS NULL AND username = "
+                    "(SELECT username FROM accounts WHERE id = %s) "
+                    "ORDER BY redeemed_at DESC LIMIT 1)",
+                    (uid, account_id),
+                )
+    return True
+
+
+def db_expire_user(user_id: int) -> bool:
+    """Ends the user's access right now."""
     with connect() as conn:
         cur = conn.execute(
-            "DELETE FROM codes WHERE code = %s AND redeemed_by IS NULL", (code,)
+            "UPDATE users SET expires_at = %s WHERE user_id = %s",
+            (datetime.now(timezone.utc), user_id),
         )
         return cur.rowcount > 0
+
+
+def _user_where(q: str | None):
+    if not q:
+        return "", ()
+    like = q.strip().lstrip("@").replace("\\", "\\\\").replace("%", "\\%")
+    like = "%" + like.replace("_", "\\_") + "%"
+    return (
+        "WHERE CAST(user_id AS TEXT) LIKE %s ESCAPE '\\' "
+        "OR LOWER(COALESCE(username, '')) LIKE LOWER(%s) ESCAPE '\\'",
+        (like, like),
+    )
+
+
+def db_count_users(q: str | None = None) -> int:
+    where, params = _user_where(q)
+    with connect() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM users {where}", params).fetchone()[0]
+
+
+def db_list_users(q: str | None, limit: int, offset: int):
+    """(user_id, username, expires_at) - latest expiry first."""
+    where, params = _user_where(q)
+    with connect() as conn:
+        return conn.execute(
+            f"SELECT user_id, username, expires_at FROM users {where} "
+            "ORDER BY expires_at DESC, user_id LIMIT %s OFFSET %s",
+            params + (limit, offset),
+        ).fetchall()
+
+
+def db_get_user(user_id: int):
+    """(user_id, username, expires_at, codes_redeemed) or None."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT u.user_id, u.username, u.expires_at, "
+            "(SELECT COUNT(*) FROM codes c WHERE c.redeemed_by = u.user_id) "
+            "FROM users u WHERE u.user_id = %s",
+            (user_id,),
+        ).fetchone()
+
 
 
 def db_stats():
@@ -297,9 +438,7 @@ M = {
     "btn_gen": "🎟 {days} ថ្ងៃ",
     "btn_add_account": "➕ បង្កើតគណនី",
     "btn_accounts": "📂 គណនីទាំងអស់",
-    "btn_codes": "📋 កូដមិនទាន់ប្រើ",
-    "btn_user": "🔍 ពិនិត្យអ្នកប្រើ",
-    "btn_revoke": "🗑 លុបកូដ",
+    "btn_codes": "📋 កូដ",
     "btn_delete_account": "🗑 លុបគណនី",
     "btn_yes_delete": "✅ បាទ/ចាស លុប",
     "btn_no": "↩ ទេ",
@@ -361,18 +500,72 @@ M = {
     "gen_range": "ចំនួនថ្ងៃត្រូវតែពី 1 ដល់ 3650 និងចំនួនកូដពី 1 ដល់ 20។",
     "no_codes": "គ្មានកូដដែលមិនទាន់ប្រើទេ។",
     "codes_list": "កូដមិនទាន់ប្រើ ({n}):\n\n{body}",
-    "ask_user": "សូមផ្ញើលេខសម្គាល់ Telegram ឬ @username របស់អ្នកប្រើ។",
-    "ask_revoke": "សូមផ្ញើកូដដែលអ្នកចង់លុប (SK-XXXX-XXXX-XXXX)។",
-    "user_not_found": "រកមិនឃើញអ្នកប្រើទេ។ សូមផ្ញើ ID / @username ផ្សេង ឬចុចបោះបង់។",
-    "user_info": "👤 អ្នកប្រើ\nID: {id}\nឈ្មោះអ្នកប្រើ: {name}\n{state}",
     "user_state_active": "សកម្ម\nផុតកំណត់: {date}\nនៅសល់: {left}",
     "user_state_expired": "ផុតកំណត់នៅ {date}",
     "revoked": "បានលុបកូដរួចរាល់។",
-    "revoke_fail": "រកមិនឃើញកូដ ឬកូដត្រូវបានប្រើរួចហើយ។",
+    "revoke_fail": "រកមិនឃើញកូដ។",
     "revoke_usage": "របៀបប្រើ: /revoke SK-XXXX-XXXX-XXXX",
     "user_usage": "របៀបប្រើ: /user TELEGRAM_ID",
     "user_never": "អ្នកប្រើនេះមិនទាន់ធ្វើឱ្យសកម្មកូដណាមួយទេ។",
     "user_cmd_info": "ផុតកំណត់: {date}\nនៅសល់: {left}",
+    # admin: users & codes lists
+    "btn_users": "👥 អ្នកប្រើ",
+    "btn_search": "🔍 ស្វែងរក",
+    "btn_clear_search": "✖ សម្អាតការស្វែងរក",
+    "btn_back_users": "⬅ ត្រឡប់ទៅបញ្ជីអ្នកប្រើ",
+    "btn_back_codes": "⬅ ត្រឡប់ទៅបញ្ជីកូដ",
+    "btn_delete_code": "🗑 លុបកូដនេះ",
+    "btn_clean_used": "🧹 លុបកូដប្រើរួចទាំងអស់",
+    "flt_a": "📋 ទាំងអស់",
+    "flt_u": "🟢 មិនទាន់ប្រើ",
+    "flt_r": "✅ ប្រើរួច",
+    "users_title": (
+        "👥 អ្នកប្រើ ({n}) · ទំព័រ {p}/{pages}\n"
+        "🟢 = សកម្ម, 🔴 = ផុតកំណត់\n"
+        "ចុចលើអ្នកប្រើ ដើម្បីមើលព័ត៌មាន៖"
+    ),
+    "users_search_title": (
+        "🔍 លទ្ធផលស្វែងរក «{q}» ({n}) · ទំព័រ {p}/{pages}\n"
+        "🟢 = សកម្ម, 🔴 = ផុតកំណត់"
+    ),
+    "users_empty": "រកមិនឃើញអ្នកប្រើទេ។",
+    "ask_search": "សូមផ្ញើ ID ឬ @username (ឬផ្នែកណាមួយនៃឈ្មោះ) ដើម្បីស្វែងរក។",
+    "ud_title": "👤 អ្នកប្រើ",
+    "ud_codes": "កូដដែលបានប្រើ: {n}",
+    "codes_title": (
+        "📋 កូដ · {filter} ({n}) · ទំព័រ {p}/{pages}\n"
+        "🟢 = មិនទាន់ប្រើ, ✅ = ប្រើរួច\n"
+        "ចុចលើកូដ ដើម្បីមើល ឬលុប៖"
+    ),
+    "codes_empty": "គ្មានកូដទេ។",
+    "cd_title": "🎟 <code>{code}</code>",
+    "cd_days": "រយៈពេល: {days} ថ្ងៃ",
+    "cd_account": "គណនី: {v}",
+    "cd_created": "បង្កើតនៅ: {v}",
+    "cd_used": "ស្ថានភាព: ប្រើរួចដោយ {who} នៅ {date}",
+    "cd_unused": "ស្ថានភាព: មិនទាន់ប្រើ",
+    "code_confirm_delete": "⚠️ តើអ្នកប្រាកដថាចង់លុបកូដ <code>{code}</code> មែនទេ?",
+    "code_confirm_used": (
+        "\nកូដនេះត្រូវបានប្រើរួចហើយ។ សូមជ្រើសរើស៖\n"
+        "• លុបកូដ និងដកសិទ្ធិ: ដកចំនួនថ្ងៃរបស់កូដនេះ និងគណនីដែលបានទទួល ចេញពីអ្នកប្រើ\n"
+        "• លុបតែកូដ: ពេលវេលារបស់អ្នកប្រើនៅដដែល"
+    ),
+    "btn_delete_revoke": "⛔ លុបកូដ និងដកសិទ្ធិ",
+    "btn_delete_only": "🗑 លុបតែកូដ",
+    "btn_yes": "✅ បាទ/ចាស",
+    "btn_revoke_access": "⛔ ដកសិទ្ធិឥឡូវនេះ",
+    "revoked_access": "បានលុបកូដ ហើយដកសិទ្ធិរបស់អ្នកប្រើរួចរាល់។",
+    "revoke_access_confirm": (
+        "⚠️ តើអ្នកប្រាកដថាចង់ដកសិទ្ធិរបស់អ្នកប្រើនេះឥឡូវនេះមែនទេ?\n"
+        "គាត់នឹងឃើញស្ថានភាព «ផុតកំណត់» ភ្លាមៗ។"
+    ),
+    "access_revoked": "✅ បានដកសិទ្ធិរបស់អ្នកប្រើរួចរាល់។",
+    "clean_confirm": (
+        "⚠️ លុបកូដដែលប្រើរួចទាំងអស់ ({n}) មែនទេ?\n"
+        "ពេលវេលារបស់អ្នកប្រើនឹងមិនប៉ះពាល់ទេ។"
+    ),
+    "clean_none": "មិនមានកូដដែលប្រើរួចទេ។",
+    "cleaned": "🧹 បានលុបកូដដែលប្រើរួចចំនួន {n}។",
     # admin: accounts (username + password)
     "ask_acc_username": "សូមផ្ញើ ឈ្មោះអ្នកប្រើ (username) សម្រាប់គណនីថ្មី។",
     "ask_acc_password": "សូមផ្ញើ ពាក្យសម្ងាត់ (password) សម្រាប់គណនីនេះ។",
@@ -464,10 +657,9 @@ def admin_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(M["btn_accounts"], callback_data="ax_list"),
             ],
             [
-                InlineKeyboardButton(M["btn_codes"], callback_data="adm_codes"),
-                InlineKeyboardButton(M["btn_user"], callback_data="adm_user"),
+                InlineKeyboardButton(M["btn_codes"], callback_data="adm_codes_a_0"),
+                InlineKeyboardButton(M["btn_users"], callback_data="adm_users"),
             ],
-            [InlineKeyboardButton(M["btn_revoke"], callback_data="adm_revoke")],
             [InlineKeyboardButton(M["btn_back"], callback_data="back")],
         ]
     )
@@ -641,6 +833,173 @@ async def show_account(
     )
 
 
+# ------------------------------------------- admin: users & codes (lists)
+PAGE_SIZE = 8
+
+
+def pager_row(prefix: str, page: int, pages: int) -> list:
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅", callback_data=f"{prefix}{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        row.append(InlineKeyboardButton("➡", callback_data=f"{prefix}{page + 1}"))
+    return row
+
+
+def page_count(total: int) -> int:
+    return max(1, -(-total // PAGE_SIZE))
+
+
+async def show_users(bot, chat_id: int, mid, ud: dict, page: int = 0):
+    q = ud.get("user_q")
+    total = await asyncio.to_thread(db_count_users, q)
+    pages = page_count(total)
+    page = min(max(page, 0), pages - 1)
+    ud["users_page"] = page
+    rows = await asyncio.to_thread(db_list_users, q, PAGE_SIZE, page * PAGE_SIZE)
+
+    now = datetime.now(timezone.utc)
+    buttons = []
+    for uid, uname, expiry in rows:
+        icon = "🟢" if expiry > now else "🔴"
+        name = f"@{uname}" if uname else "-"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{icon} {name[:24]} · {uid}", callback_data=f"adm_uview_{uid}"
+                )
+            ]
+        )
+    if pages > 1:
+        buttons.append(pager_row("adm_users_", page, pages))
+    tools = [InlineKeyboardButton(M["btn_search"], callback_data="adm_usearch")]
+    if q:
+        tools.append(InlineKeyboardButton(M["btn_clear_search"], callback_data="adm_uclear"))
+    buttons.append(tools)
+    buttons.append([InlineKeyboardButton(M["btn_back"], callback_data="admin")])
+
+    if not rows:
+        title = M["users_empty"]
+    elif q:
+        title = M["users_search_title"].format(q=q, n=total, p=page + 1, pages=pages)
+    else:
+        title = M["users_title"].format(n=total, p=page + 1, pages=pages)
+    await render(bot, chat_id, mid, title, InlineKeyboardMarkup(buttons))
+
+
+async def show_user(bot, chat_id: int, mid, ud: dict, uid: int, prefix: str = ""):
+    back_btn = InlineKeyboardButton(
+        M["btn_back_users"], callback_data=f"adm_users_{ud.get('users_page', 0)}"
+    )
+    row = await asyncio.to_thread(db_get_user, uid)
+    if not row:
+        await render(bot, chat_id, mid, M["user_never"], InlineKeyboardMarkup([[back_btn]]))
+        return
+    uid, uname, expiry, n_codes = row
+    is_active = expiry > datetime.now(timezone.utc)
+    if is_active:
+        state = M["user_state_active"].format(
+            date=fmt_date(expiry), left=fmt_remaining(expiry)
+        )
+    else:
+        state = M["user_state_expired"].format(date=fmt_date(expiry))
+    lines = [
+        M["ud_title"],
+        M["acc_username"].format(v=esc(f"@{uname}" if uname else "-")),
+        M["acc_id"].format(v=uid),
+        state,
+        M["ud_codes"].format(n=n_codes),
+    ]
+    for u, p in await asyncio.to_thread(db_user_credentials, uid):
+        lines += ["", M["creds_block"].format(u=esc(u), p=esc(p))]
+    keyboard = []
+    if is_active:
+        keyboard.append(
+            [InlineKeyboardButton(M["btn_revoke_access"], callback_data=f"adm_uexp_{uid}")]
+        )
+    keyboard.append([back_btn])
+    await render(
+        bot, chat_id, mid, prefix + "\n".join(lines),
+        InlineKeyboardMarkup(keyboard), ParseMode.HTML,
+    )
+
+
+async def show_codes(
+    bot, chat_id: int, mid, ud: dict, f: str = "a", page: int = 0, prefix: str = ""
+):
+    f = f if f in ("a", "u", "r") else "a"
+    total = await asyncio.to_thread(db_count_codes, f)
+    pages = page_count(total)
+    page = min(max(page, 0), pages - 1)
+    ud["codes_view"] = (f, page)
+    rows = await asyncio.to_thread(db_list_codes, f, PAGE_SIZE, page * PAGE_SIZE)
+
+    buttons = []
+    for code, days, redeemed_by, acc in rows:
+        icon = "✅" if redeemed_by else "🟢"
+        label = f"{icon} {code} · {days}d" + (f" · {acc[:12]}" if acc else "")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"adm_code_{code}")])
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                ("• " if k == f else "") + M[f"flt_{k}"], callback_data=f"adm_codes_{k}_0"
+            )
+            for k in ("a", "u", "r")
+        ]
+    )
+    if pages > 1:
+        buttons.append(pager_row(f"adm_codes_{f}_", page, pages))
+    bottom = []
+    if f != "u":
+        bottom.append(InlineKeyboardButton(M["btn_clean_used"], callback_data="adm_cclean"))
+    bottom.append(InlineKeyboardButton(M["btn_back"], callback_data="admin"))
+    buttons.append(bottom)
+
+    title = (
+        M["codes_title"].format(filter=M[f"flt_{f}"], n=total, p=page + 1, pages=pages)
+        if rows
+        else M["codes_empty"]
+    )
+    await render(bot, chat_id, mid, prefix + title, InlineKeyboardMarkup(buttons))
+
+
+def codes_back_button(ud: dict) -> InlineKeyboardButton:
+    f, p = ud.get("codes_view", ("a", 0))
+    return InlineKeyboardButton(M["btn_back_codes"], callback_data=f"adm_codes_{f}_{p}")
+
+
+async def show_code(bot, chat_id: int, mid, ud: dict, code: str):
+    row = await asyncio.to_thread(db_get_code, code)
+    back = InlineKeyboardMarkup([[codes_back_button(ud)]])
+    if not row:
+        await render(bot, chat_id, mid, M["revoke_fail"], back)
+        return
+    code, days, created, redeemed_by, redeemed_at, acc, uname = row
+    lines = [
+        M["cd_title"].format(code=code),
+        M["cd_days"].format(days=days),
+        M["cd_account"].format(v=esc(acc) if acc else "-"),
+        M["cd_created"].format(v=fmt_date(created)),
+    ]
+    if redeemed_by:
+        who = f"@{uname}" if uname else str(redeemed_by)
+        lines.append(M["cd_used"].format(who=esc(who), date=fmt_date(redeemed_at)))
+    else:
+        lines.append(M["cd_unused"])
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    M["btn_delete_code"], callback_data=f"adm_cdel_{code}"
+                )
+            ],
+            [codes_back_button(ud)],
+        ]
+    )
+    await render(bot, chat_id, mid, "\n".join(lines), markup, ParseMode.HTML)
+
+
 # --------------------------------------------------------- user commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_pending(context)
@@ -690,7 +1049,10 @@ async def vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------------- button handling
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()  # only stops the button's loading spinner
+    except NetworkError:
+        pass  # a slow connection must not stop the button from working
     user = query.from_user
     data = query.data
     msg = query.message
@@ -700,40 +1062,144 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Replace the text of the message that holds the pressed button."""
         return await render(bot, chat_id, mid, text, markup, mode)
 
+    if data == "noop":  # the page-number button
+        return
+
     # ---- admin buttons (always re-check the user is an admin)
     if data == "admin" or data.startswith(("adm_", "ax_")):
         if user.id not in ADMIN_IDS:
             await show(M["admins_only"], main_menu(user.id))
             return
         clear_pending(context)
+        ud = context.user_data
 
         if data == "admin":
             await show(await admin_panel_text(), admin_menu())
 
-        elif data == "adm_codes":
-            rows = await asyncio.to_thread(db_unused_codes)
-            if not rows:
-                await show(M["no_codes"], admin_menu())
+        elif data == "adm_users":
+            ud.pop("user_q", None)
+            await show_users(bot, chat_id, mid, ud, 0)
+
+        elif data.startswith("adm_users_"):
+            await show_users(bot, chat_id, mid, ud, int(data.rsplit("_", 1)[1]))
+
+        elif data == "adm_uclear":
+            ud.pop("user_q", None)
+            await show_users(bot, chat_id, mid, ud, 0)
+
+        elif data == "adm_usearch":
+            ud["admin_action"] = "user_search"
+            ud["prompt_id"] = mid
+            await show(
+                M["ask_search"],
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(M["btn_cancel"], callback_data="adm_users")]]
+                ),
+            )
+
+        elif data.startswith("adm_uview_"):
+            await show_user(bot, chat_id, mid, ud, int(data.rsplit("_", 1)[1]))
+
+        elif data.startswith("adm_uexp_"):
+            uid = int(data.rsplit("_", 1)[1])
+            await show(
+                M["revoke_access_confirm"],
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(M["btn_yes"], callback_data=f"adm_uexpok_{uid}"),
+                            InlineKeyboardButton(M["btn_no"], callback_data=f"adm_uview_{uid}"),
+                        ]
+                    ]
+                ),
+            )
+
+        elif data.startswith("adm_uexpok_"):
+            uid = int(data.rsplit("_", 1)[1])
+            ok = await asyncio.to_thread(db_expire_user, uid)
+            await show_user(
+                bot, chat_id, mid, ud, uid,
+                prefix=(M["access_revoked"] if ok else M["user_never"]) + "\n\n",
+            )
+
+        elif data.startswith("adm_codes_"):
+            _, _, f, page = data.split("_")
+            await show_codes(bot, chat_id, mid, ud, f, int(page))
+
+        elif data.startswith("adm_code_"):
+            await show_code(bot, chat_id, mid, ud, data[len("adm_code_"):])
+
+        elif data.startswith("adm_cdel_"):
+            code = data[len("adm_cdel_"):]
+            row = await asyncio.to_thread(db_get_code, code)
+            if not row:
+                await show(M["revoke_fail"], InlineKeyboardMarkup([[codes_back_button(ud)]]))
+                return
+            text = M["code_confirm_delete"].format(code=code)
+            if row[3]:  # already redeemed -> the admin chooses what happens to the user
+                text += M["code_confirm_used"]
+                choices = [
+                    [InlineKeyboardButton(M["btn_delete_revoke"], callback_data=f"adm_cdelrv_{code}")],
+                    [InlineKeyboardButton(M["btn_delete_only"], callback_data=f"adm_cdelok_{code}")],
+                    [InlineKeyboardButton(M["btn_no"], callback_data=f"adm_code_{code}")],
+                ]
             else:
-                body = "\n".join(
-                    f"<code>{c}</code> ({d} ថ្ងៃ{' · ' + esc(a) if a else ''})"
-                    for c, d, a in rows
-                )
-                await show(
-                    M["codes_list"].format(n=len(rows), body=body),
-                    admin_menu(),
-                    ParseMode.HTML,
-                )
+                choices = [
+                    [
+                        InlineKeyboardButton(M["btn_yes_delete"], callback_data=f"adm_cdelok_{code}"),
+                        InlineKeyboardButton(M["btn_no"], callback_data=f"adm_code_{code}"),
+                    ]
+                ]
+            await show(text, InlineKeyboardMarkup(choices), ParseMode.HTML)
 
-        elif data == "adm_user":
-            context.user_data["admin_action"] = "check_user"
-            context.user_data["prompt_id"] = mid
-            await show(M["ask_user"], cancel_menu())
+        elif data.startswith("adm_cdelrv_"):
+            ok = await asyncio.to_thread(
+                db_delete_code_and_revoke, data[len("adm_cdelrv_"):]
+            )
+            f, page = ud.get("codes_view", ("a", 0))
+            await show_codes(
+                bot, chat_id, mid, ud, f, page,
+                prefix=(M["revoked_access"] if ok else M["revoke_fail"]) + "\n\n",
+            )
 
-        elif data == "adm_revoke":
-            context.user_data["admin_action"] = "revoke"
-            context.user_data["prompt_id"] = mid
-            await show(M["ask_revoke"], cancel_menu())
+        elif data.startswith("adm_cdelok_"):
+            ok = await asyncio.to_thread(db_delete_code, data[len("adm_cdelok_"):])
+            f, page = ud.get("codes_view", ("a", 0))
+            await show_codes(
+                bot, chat_id, mid, ud, f, page,
+                prefix=(M["revoked"] if ok else M["revoke_fail"]) + "\n\n",
+            )
+
+        elif data == "adm_cclean":
+            n = await asyncio.to_thread(db_count_codes, "r")
+            if n == 0:
+                f, page = ud.get("codes_view", ("a", 0))
+                await show_codes(
+                    bot, chat_id, mid, ud, f, page, prefix=M["clean_none"] + "\n\n"
+                )
+                return
+            f, page = ud.get("codes_view", ("a", 0))
+            await show(
+                M["clean_confirm"].format(n=n),
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                M["btn_yes_delete"], callback_data="adm_ccleanok"
+                            ),
+                            InlineKeyboardButton(
+                                M["btn_no"], callback_data=f"adm_codes_{f}_{page}"
+                            ),
+                        ]
+                    ]
+                ),
+            )
+
+        elif data == "adm_ccleanok":
+            n = await asyncio.to_thread(db_clean_used)
+            await show_codes(
+                bot, chat_id, mid, ud, "a", 0, prefix=M["cleaned"].format(n=n) + "\n\n"
+            )
 
         elif data == "ax_add":
             context.user_data["admin_action"] = "acc_username"
@@ -866,31 +1332,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if action == "check_user":
-            row = await asyncio.to_thread(db_find_user, text)
-            if not row:
-                ud["prompt_id"] = await show(
-                    M["user_not_found"] + fail_mark(context), cancel_menu()
-                )
-                return
-            uid, uname, expiry = row
-            if expiry > datetime.now(timezone.utc):
-                state = M["user_state_active"].format(
-                    date=fmt_date(expiry), left=fmt_remaining(expiry)
-                )
-            else:
-                state = M["user_state_expired"].format(date=fmt_date(expiry))
+        if action == "user_search":
             clear_pending(context)
-            await show(
-                M["user_info"].format(
-                    id=uid, name=("@" + uname) if uname else "-", state=state
-                ),
-                admin_menu(),
-            )
-        elif action == "revoke":
-            ok = await asyncio.to_thread(db_revoke, text.upper())
-            clear_pending(context)
-            await show(M["revoked"] if ok else M["revoke_fail"], admin_menu())
+            ud["user_q"] = text
+            await show_users(context.bot, chat_id, prompt_id, ud, 0)
         return
 
     # ---- activation code
@@ -949,7 +1394,7 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(M["revoke_usage"])
         return
-    ok = await asyncio.to_thread(db_revoke, context.args[0].strip().upper())
+    ok = await asyncio.to_thread(db_delete_code, context.args[0].strip().upper())
     await update.message.reply_text(M["revoked"] if ok else M["revoke_fail"])
 
 
@@ -969,6 +1414,9 @@ async def user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, NetworkError):  # includes TimedOut
+        log.warning("Network problem talking to Telegram: %s", context.error)
+        return
     log.error("Unhandled error", exc_info=context.error)
 
 
@@ -977,7 +1425,17 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_web, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        # more patient than the defaults (5s): helps on slow / unstable internet
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .get_updates_read_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("redeem", redeem))
