@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import secrets
@@ -32,6 +33,9 @@ ADMIN_IDS = {
 DEFAULT_DAYS = 30
 LOCAL_TZ = timezone(timedelta(hours=7))  # Cambodia / Thailand time (UTC+7)
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I to avoid typos
+MAX_FIELD_LEN = 100
+
+esc = html.escape  # user text goes into HTML messages, always escape it
 
 # ---------------------------------------------------------- health server
 web = Flask(__name__)
@@ -74,6 +78,30 @@ def init_db():
             )
             """
         )
+        # accounts the admin creates (username + password handed out with a code)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id         SERIAL PRIMARY KEY,
+                username   TEXT NOT NULL,
+                password   TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        # copy of the credentials each user received (survives account deletion)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_accounts (
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT NOT NULL,
+                username    TEXT NOT NULL,
+                password    TEXT NOT NULL,
+                redeemed_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute("ALTER TABLE codes ADD COLUMN IF NOT EXISTS account_id INTEGER")
 
 
 def new_code() -> str:
@@ -81,32 +109,35 @@ def new_code() -> str:
     return "SK-" + "-".join(parts)
 
 
-def db_generate(admin_id: int, days: int, count: int) -> list[str]:
+def db_generate(
+    admin_id: int, days: int, count: int, account_id: int | None = None
+) -> list[str]:
     now = datetime.now(timezone.utc)
     codes = [new_code() for _ in range(count)]
     with connect() as conn:
         for c in codes:
             conn.execute(
-                "INSERT INTO codes (code, days, created_at, created_by) "
-                "VALUES (%s, %s, %s, %s)",
-                (c, days, now, admin_id),
+                "INSERT INTO codes (code, days, created_at, created_by, account_id) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (c, days, now, admin_id, account_id),
             )
     return codes
 
 
 def db_redeem(code: str, user_id: int, username: str | None):
-    """Returns (days, new_expiry) or None if the code is invalid / already used."""
+    """Returns (days, new_expiry, creds) or None if the code is invalid / used.
+    creds is (username, password) when the code is linked to an account."""
     now = datetime.now(timezone.utc)
     with connect() as conn:
         # atomic: only one person can ever claim a code
         row = conn.execute(
             "UPDATE codes SET redeemed_by = %s, redeemed_at = %s "
-            "WHERE code = %s AND redeemed_by IS NULL RETURNING days",
+            "WHERE code = %s AND redeemed_by IS NULL RETURNING days, account_id",
             (user_id, now, code),
         ).fetchone()
         if not row:
             return None
-        days = row[0]
+        days, account_id = row
 
         current = conn.execute(
             "SELECT expires_at FROM users WHERE user_id = %s", (user_id,)
@@ -121,7 +152,20 @@ def db_redeem(code: str, user_id: int, username: str | None):
             "SET username = EXCLUDED.username, expires_at = EXCLUDED.expires_at",
             (user_id, username, new_expiry),
         )
-    return days, new_expiry
+
+        creds = None
+        if account_id is not None:
+            acc = conn.execute(
+                "SELECT username, password FROM accounts WHERE id = %s", (account_id,)
+            ).fetchone()
+            if acc:
+                conn.execute(
+                    "INSERT INTO user_accounts (user_id, username, password, redeemed_at) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (user_id, acc[0], acc[1], now),
+                )
+                creds = (acc[0], acc[1])
+    return days, new_expiry, creds
 
 
 def db_get_expiry(user_id: int):
@@ -132,11 +176,21 @@ def db_get_expiry(user_id: int):
     return row[0] if row else None
 
 
+def db_user_credentials(user_id: int):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT username, password FROM user_accounts "
+            "WHERE user_id = %s ORDER BY redeemed_at",
+            (user_id,),
+        ).fetchall()
+
+
 def db_unused_codes(limit: int = 50):
     with connect() as conn:
         return conn.execute(
-            "SELECT code, days FROM codes WHERE redeemed_by IS NULL "
-            "ORDER BY created_at DESC LIMIT %s",
+            "SELECT c.code, c.days, a.username FROM codes c "
+            "LEFT JOIN accounts a ON a.id = c.account_id "
+            "WHERE c.redeemed_by IS NULL ORDER BY c.created_at DESC LIMIT %s",
             (limit,),
         ).fetchall()
 
@@ -149,9 +203,81 @@ def db_revoke(code: str) -> bool:
         return cur.rowcount > 0
 
 
+def db_stats():
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        active = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE expires_at > %s", (now,)
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        unused = conn.execute(
+            "SELECT COUNT(*) FROM codes WHERE redeemed_by IS NULL"
+        ).fetchone()[0]
+        accounts = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+    return active, total, unused, accounts
+
+
+def db_find_user(query: str):
+    """Find a user by Telegram ID or @username. Returns (id, username, expiry)."""
+    q = query.strip().lstrip("@")
+    uid = int(q) if q.isdigit() else None
+    with connect() as conn:
+        return conn.execute(
+            "SELECT user_id, username, expires_at FROM users "
+            "WHERE user_id = %s OR LOWER(username) = LOWER(%s)",
+            (uid, q),
+        ).fetchone()
+
+
+# ---- accounts (admin)
+def db_add_account(username: str, password: str) -> int:
+    with connect() as conn:
+        return conn.execute(
+            "INSERT INTO accounts (username, password, created_at) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (username, password, datetime.now(timezone.utc)),
+        ).fetchone()[0]
+
+
+def db_list_accounts(limit: int = 50):
+    """(id, username, unused_codes, redeemed_codes) newest first."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT a.id, a.username, "
+            "COUNT(c.code) FILTER (WHERE c.redeemed_by IS NULL), "
+            "COUNT(c.code) FILTER (WHERE c.redeemed_by IS NOT NULL) "
+            "FROM accounts a LEFT JOIN codes c ON c.account_id = a.id "
+            "GROUP BY a.id ORDER BY a.id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+
+
+def db_get_account(account_id: int):
+    """(id, username, password, unused_codes, redeemed_codes) or None."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT a.id, a.username, a.password, "
+            "COUNT(c.code) FILTER (WHERE c.redeemed_by IS NULL), "
+            "COUNT(c.code) FILTER (WHERE c.redeemed_by IS NOT NULL) "
+            "FROM accounts a LEFT JOIN codes c ON c.account_id = a.id "
+            "WHERE a.id = %s GROUP BY a.id",
+            (account_id,),
+        ).fetchone()
+
+
+def db_delete_account(account_id: int) -> bool:
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM codes WHERE account_id = %s AND redeemed_by IS NULL",
+            (account_id,),
+        )
+        cur = conn.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
+        return cur.rowcount > 0
+
 
 # ======================================================================
 #  MESSAGES (Khmer) - edit any text here, the code below doesn't need to change
+#  Keep the {placeholders} and the <code>...</code> tags as they are.
 # ======================================================================
 M = {
     # buttons
@@ -160,10 +286,16 @@ M = {
     "btn_admin": "🛠 ផ្ទាំងអ្នកគ្រប់គ្រង",
     "btn_cancel": "✖ បោះបង់",
     "btn_back": "⬅ ត្រឡប់ក្រោយ",
-    "btn_gen": "➕ {days} ថ្ងៃ",
+    "btn_back_list": "⬅ ត្រឡប់ទៅបញ្ជីគណនី",
+    "btn_gen": "🎟 {days} ថ្ងៃ",
+    "btn_add_account": "➕ បង្កើតគណនី",
+    "btn_accounts": "📂 គណនីទាំងអស់",
     "btn_codes": "📋 កូដមិនទាន់ប្រើ",
     "btn_user": "🔍 ពិនិត្យអ្នកប្រើ",
     "btn_revoke": "🗑 លុបកូដ",
+    "btn_delete_account": "🗑 លុបគណនី",
+    "btn_yes_delete": "✅ បាទ/ចាស លុប",
+    "btn_no": "↩ ទេ",
     # general
     "welcome": "សូមស្វាគមន៍! សូមជ្រើសរើសជម្រើស៖",
     "choose": "សូមជ្រើសរើសជម្រើស៖",
@@ -173,7 +305,7 @@ M = {
     # time
     "expired_word": "ផុតកំណត់ហើយ",
     "remaining_fmt": "{d} ថ្ងៃ {h} ម៉ោង {m} នាទី",
-    # account
+    # account screen
     "acc_title": "👤 គណនី",
     "acc_username": "ឈ្មោះអ្នកប្រើ: {v}",
     "acc_id": "លេខសម្គាល់អ្នកប្រើ (ID): {v}",
@@ -183,6 +315,11 @@ M = {
     "acc_active": "ស្ថានភាព: សកម្ម",
     "acc_expires": "ផុតកំណត់: {v}",
     "acc_remaining": "ពេលវេលានៅសល់: {v}",
+    "creds_block": (
+        "🔐 ព័ត៌មានគណនីរបស់អ្នក\n"
+        "ឈ្មោះអ្នកប្រើ: <code>{u}</code>\n"
+        "ពាក្យសម្ងាត់: <code>{p}</code>"
+    ),
     # activation
     "ask_code": "សូមផ្ញើកូដធ្វើឱ្យសកម្មរបស់អ្នកឥឡូវនេះ។\nឧទាហរណ៍: SK-XXXX-XXXX-XXXX",
     "retry_code": "\nសូមផ្ញើកូដម្ដងទៀត ឬចុចបោះបង់។",
@@ -203,14 +340,11 @@ M = {
     # admin panel
     "panel": (
         "🛠 ផ្ទាំងអ្នកគ្រប់គ្រង\n"
+        "គណនីសរុប: {accounts}\n"
         "អ្នកប្រើសកម្ម: {active}\n"
         "អ្នកប្រើសរុប: {total}\n"
         "កូដមិនទាន់ប្រើ: {unused}\n\n"
         "សូមជ្រើសរើសសកម្មភាព៖"
-    ),
-    "gen_one": (
-        "កូដថ្មី {days} ថ្ងៃ:\n\n<code>{code}</code>\n\n"
-        "ចុចលើកូដដើម្បីចម្លង រួចផ្ញើទៅអ្នកប្រើ។"
     ),
     "gen_many": (
         "បានបង្កើតកូដចំនួន {count} (មួយកូដ {days} ថ្ងៃ):\n\n{body}\n\n"
@@ -232,32 +366,36 @@ M = {
     "user_usage": "របៀបប្រើ: /user TELEGRAM_ID",
     "user_never": "អ្នកប្រើនេះមិនទាន់ធ្វើឱ្យសកម្មកូដណាមួយទេ។",
     "user_cmd_info": "ផុតកំណត់: {date}\nនៅសល់: {left}",
+    # admin: accounts (username + password)
+    "ask_acc_username": "សូមផ្ញើ ឈ្មោះអ្នកប្រើ (username) សម្រាប់គណនីថ្មី។",
+    "ask_acc_password": "សូមផ្ញើ ពាក្យសម្ងាត់ (password) សម្រាប់គណនីនេះ។",
+    "acc_empty_input": "មិនអាចទទេបានទេ។ សូមផ្ញើម្ដងទៀត ឬចុចបោះបង់។",
+    "acc_too_long": "វែងពេក (អតិបរមា 100 តួអក្សរ)។ សូមផ្ញើម្ដងទៀត ឬចុចបោះបង់។",
+    "acc_created": "✅ បានបង្កើតគណនីថ្មី!\n\n",
+    "acc_detail": (
+        "🔹 គណនី\n"
+        "ឈ្មោះអ្នកប្រើ: <code>{u}</code>\n"
+        "ពាក្យសម្ងាត់: <code>{p}</code>\n"
+        "កូដមិនទាន់ប្រើ: {unused}\n"
+        "កូដប្រើរួច: {used}\n\n"
+        "ជ្រើសរើសរយៈពេល ដើម្បីបង្កើតកូដធ្វើឱ្យសកម្មសម្រាប់គណនីនេះ៖"
+    ),
+    "acc_list_title": "📂 គណនីទាំងអស់ ({n})\nចុចលើគណនីមួយ ដើម្បីបង្កើតកូដ៖\n(🎟 = កូដមិនទាន់ប្រើ, ✅ = ប្រើរួច)",
+    "acc_list_empty": "មិនទាន់មានគណនីទេ។ ចុច «បង្កើតគណនី» ដើម្បីបន្ថែម។",
+    "acc_not_found": "រកមិនឃើញគណនីនេះទេ។",
+    "acc_confirm_delete": (
+        "⚠️ តើអ្នកប្រាកដថាចង់លុបគណនី <code>{u}</code> មែនទេ?\n"
+        "កូដដែលមិនទាន់ប្រើរបស់គណនីនេះនឹងត្រូវលុបដែរ។ "
+        "អ្នកប្រើដែលបានទទួលរួចហើយនឹងមិនរងផលប៉ះពាល់ទេ។"
+    ),
+    "acc_deleted": "បានលុបគណនីរួចរាល់។",
+    "gen_for_account": (
+        "🎟 កូដថ្មី {days} ថ្ងៃ សម្រាប់គណនី <code>{u}</code>:\n\n"
+        "<code>{code}</code>\n\n"
+        "ចុចលើកូដដើម្បីចម្លង រួចផ្ញើទៅអ្នកប្រើ។ "
+        "នៅពេលអ្នកប្រើធ្វើឱ្យសកម្ម គាត់នឹងទទួលបានឈ្មោះអ្នកប្រើ និងពាក្យសម្ងាត់។"
+    ),
 }
-
-
-def db_stats():
-    now = datetime.now(timezone.utc)
-    with connect() as conn:
-        active = conn.execute(
-            "SELECT COUNT(*) FROM users WHERE expires_at > %s", (now,)
-        ).fetchone()[0]
-        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        unused = conn.execute(
-            "SELECT COUNT(*) FROM codes WHERE redeemed_by IS NULL"
-        ).fetchone()[0]
-    return active, total, unused
-
-
-def db_find_user(query: str):
-    """Find a user by Telegram ID or @username. Returns (id, username, expiry)."""
-    q = query.strip().lstrip("@")
-    uid = int(q) if q.isdigit() else None
-    with connect() as conn:
-        return conn.execute(
-            "SELECT user_id, username, expires_at FROM users "
-            "WHERE user_id = %s OR LOWER(username) = LOWER(%s)",
-            (uid, q),
-        ).fetchone()
 
 
 # ---------------------------------------------------------------- helpers
@@ -315,8 +453,8 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(M["btn_gen"].format(days=d), callback_data=f"adm_gen_{d}")
-                for d in (7, 30, 90)
+                InlineKeyboardButton(M["btn_add_account"], callback_data="ax_add"),
+                InlineKeyboardButton(M["btn_accounts"], callback_data="ax_list"),
             ],
             [
                 InlineKeyboardButton(M["btn_codes"], callback_data="adm_codes"),
@@ -328,6 +466,26 @@ def admin_menu() -> InlineKeyboardMarkup:
     )
 
 
+def account_menu(acc_id: int) -> InlineKeyboardMarkup:
+    gens = [
+        InlineKeyboardButton(
+            M["btn_gen"].format(days=d), callback_data=f"ax_gen_{acc_id}_{d}"
+        )
+        for d in (7, 30, 90)
+    ]
+    return InlineKeyboardMarkup(
+        [
+            gens,
+            [
+                InlineKeyboardButton(
+                    M["btn_delete_account"], callback_data=f"ax_del_{acc_id}"
+                )
+            ],
+            [InlineKeyboardButton(M["btn_back_list"], callback_data="ax_list")],
+        ]
+    )
+
+
 def cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(M["btn_cancel"], callback_data="cancel")]]
@@ -335,13 +493,15 @@ def cancel_menu() -> InlineKeyboardMarkup:
 
 
 def clear_pending(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("awaiting_code", None)
-    context.user_data.pop("admin_action", None)
+    for key in ("awaiting_code", "admin_action", "new_acc_username"):
+        context.user_data.pop(key, None)
 
 
 async def admin_panel_text() -> str:
-    active, total, unused = await asyncio.to_thread(db_stats)
-    return M["panel"].format(active=active, total=total, unused=unused)
+    active, total, unused, accounts = await asyncio.to_thread(db_stats)
+    return M["panel"].format(
+        active=active, total=total, unused=unused, accounts=accounts
+    )
 
 
 async def account_text(user) -> str:
@@ -349,12 +509,13 @@ async def account_text(user) -> str:
     name = f"@{user.username}" if user.username else (user.full_name or "-")
     lines = [
         M["acc_title"],
-        M["acc_username"].format(v=name),
+        M["acc_username"].format(v=esc(name)),
         M["acc_id"].format(v=user.id),
     ]
+    now = datetime.now(timezone.utc)
     if not expiry:
         lines.append(M["acc_not_active"])
-    elif expiry <= datetime.now(timezone.utc):
+    elif expiry <= now:
         lines += [M["acc_expired"], M["acc_expired_on"].format(v=fmt_date(expiry))]
     else:
         lines += [
@@ -362,23 +523,76 @@ async def account_text(user) -> str:
             M["acc_expires"].format(v=fmt_date(expiry)),
             M["acc_remaining"].format(v=fmt_remaining(expiry)),
         ]
+        # the username/password is only shown while the access is active
+        creds = await asyncio.to_thread(db_user_credentials, user.id)
+        for u, p in creds:
+            lines += ["", M["creds_block"].format(u=esc(u), p=esc(p))]
     return "\n".join(lines)
 
 
 async def do_redeem(code: str, user) -> tuple[str, bool]:
-    """Shared by /redeem and the Activate button. Returns (message, success)."""
+    """Shared by /redeem and the Activate button. Returns (HTML message, success)."""
     result = await asyncio.to_thread(db_redeem, code, user.id, user.username)
     if result is None:
         return M["bad_code"], False
-    days, expiry = result
-    text = "\n".join(
+    days, expiry, creds = result
+    lines = [
+        M["activated"].format(days=days),
+        M["acc_expires"].format(v=fmt_date(expiry)),
+        M["acc_remaining"].format(v=fmt_remaining(expiry)),
+    ]
+    if creds:
+        lines += ["", M["creds_block"].format(u=esc(creds[0]), p=esc(creds[1]))]
+    return "\n".join(lines), True
+
+
+# ---------------------------------------------------- admin account screens
+async def show_account_list(bot, chat_id: int):
+    rows = await asyncio.to_thread(db_list_accounts)
+    if not rows:
+        await bot.send_message(
+            chat_id, M["acc_list_empty"], reply_markup=admin_menu()
+        )
+        return
+    buttons = [
         [
-            M["activated"].format(days=days),
-            M["acc_expires"].format(v=fmt_date(expiry)),
-            M["acc_remaining"].format(v=fmt_remaining(expiry)),
+            InlineKeyboardButton(
+                f"👤 {name[:30]}   🎟{unused} ✅{used}",
+                callback_data=f"ax_open_{acc_id}",
+            )
+        ]
+        for acc_id, name, unused, used in rows
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(M["btn_add_account"], callback_data="ax_add"),
+            InlineKeyboardButton(M["btn_back"], callback_data="admin"),
         ]
     )
-    return text, True
+    await bot.send_message(
+        chat_id,
+        M["acc_list_title"].format(n=len(rows)),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def show_account(bot, chat_id: int, acc_id: int, prefix: str = ""):
+    acc = await asyncio.to_thread(db_get_account, acc_id)
+    if not acc:
+        await bot.send_message(
+            chat_id, M["acc_not_found"], reply_markup=admin_menu()
+        )
+        return
+    _, username, password, unused, used = acc
+    await bot.send_message(
+        chat_id,
+        prefix
+        + M["acc_detail"].format(
+            u=esc(username), p=esc(password), unused=unused, used=used
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=account_menu(acc_id),
+    )
 
 
 # --------------------------------------------------------- user commands
@@ -400,7 +614,9 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].strip().upper()
     message, _ = await do_redeem(code, update.effective_user)
     await update.message.reply_text(
-        message, reply_markup=main_menu(update.effective_user.id)
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(update.effective_user.id),
     )
 
 
@@ -432,9 +648,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     data = query.data
     msg = query.message
+    bot = context.bot
+    chat_id = msg.chat_id
 
     # ---- admin buttons (always re-check the user is an admin)
-    if data == "admin" or data.startswith("adm_"):
+    if data == "admin" or data.startswith(("adm_", "ax_")):
         if user.id not in ADMIN_IDS:
             await msg.reply_text(M["admins_only"])
             return
@@ -443,21 +661,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin":
             await msg.reply_text(await admin_panel_text(), reply_markup=admin_menu())
 
-        elif data.startswith("adm_gen_"):
-            days = int(data.rsplit("_", 1)[1])
-            codes = await asyncio.to_thread(db_generate, user.id, days, 1)
-            await msg.reply_text(
-                M["gen_one"].format(days=days, code=codes[0]),
-                parse_mode=ParseMode.HTML,
-                reply_markup=admin_menu(),
-            )
-
         elif data == "adm_codes":
             rows = await asyncio.to_thread(db_unused_codes)
             if not rows:
                 text, mode = M["no_codes"], None
             else:
-                body = "\n".join(f"<code>{c}</code> ({d} ថ្ងៃ)" for c, d in rows)
+                body = "\n".join(
+                    f"<code>{c}</code> ({d} ថ្ងៃ{' · ' + esc(a) if a else ''})"
+                    for c, d, a in rows
+                )
                 text = M["codes_list"].format(n=len(rows), body=body)
                 mode = ParseMode.HTML
             await msg.reply_text(text, parse_mode=mode, reply_markup=admin_menu())
@@ -469,12 +681,73 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "adm_revoke":
             context.user_data["admin_action"] = "revoke"
             await msg.reply_text(M["ask_revoke"], reply_markup=cancel_menu())
+
+        elif data == "ax_add":
+            context.user_data["admin_action"] = "acc_username"
+            await msg.reply_text(M["ask_acc_username"], reply_markup=cancel_menu())
+
+        elif data == "ax_list":
+            await show_account_list(bot, chat_id)
+
+        elif data.startswith("ax_open_"):
+            await show_account(bot, chat_id, int(data.rsplit("_", 1)[1]))
+
+        elif data.startswith("ax_gen_"):
+            _, _, acc_id, days = data.split("_")
+            acc_id, days = int(acc_id), int(days)
+            acc = await asyncio.to_thread(db_get_account, acc_id)
+            if not acc:
+                await msg.reply_text(M["acc_not_found"], reply_markup=admin_menu())
+                return
+            codes = await asyncio.to_thread(db_generate, user.id, days, 1, acc_id)
+            await msg.reply_text(
+                M["gen_for_account"].format(
+                    days=days, u=esc(acc[1]), code=codes[0]
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=account_menu(acc_id),
+            )
+
+        elif data.startswith("ax_del_"):
+            acc_id = int(data.rsplit("_", 1)[1])
+            acc = await asyncio.to_thread(db_get_account, acc_id)
+            if not acc:
+                await msg.reply_text(M["acc_not_found"], reply_markup=admin_menu())
+                return
+            await msg.reply_text(
+                M["acc_confirm_delete"].format(u=esc(acc[1])),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                M["btn_yes_delete"], callback_data=f"ax_delok_{acc_id}"
+                            ),
+                            InlineKeyboardButton(
+                                M["btn_no"], callback_data=f"ax_open_{acc_id}"
+                            ),
+                        ]
+                    ]
+                ),
+            )
+
+        elif data.startswith("ax_delok_"):
+            acc_id = int(data.rsplit("_", 1)[1])
+            ok = await asyncio.to_thread(db_delete_account, acc_id)
+            await msg.reply_text(
+                M["acc_deleted"] if ok else M["acc_not_found"],
+                reply_markup=admin_menu(),
+            )
         return
 
     # ---- normal user buttons
     if data == "account":
         clear_pending(context)
-        await msg.reply_text(await account_text(user), reply_markup=main_menu(user.id))
+        await msg.reply_text(
+            await account_text(user),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(user.id),
+        )
     elif data == "activate":
         clear_pending(context)
         context.user_data["awaiting_code"] = True
@@ -495,6 +768,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- admin inputs
     action = context.user_data.get("admin_action")
     if action and user.id in ADMIN_IDS:
+        if action in ("acc_username", "acc_password"):
+            if not text:
+                await update.message.reply_text(
+                    M["acc_empty_input"], reply_markup=cancel_menu()
+                )
+                return
+            if len(text) > MAX_FIELD_LEN:
+                await update.message.reply_text(
+                    M["acc_too_long"], reply_markup=cancel_menu()
+                )
+                return
+
+            if action == "acc_username":
+                context.user_data["new_acc_username"] = text
+                context.user_data["admin_action"] = "acc_password"
+                await update.message.reply_text(
+                    M["ask_acc_password"], reply_markup=cancel_menu()
+                )
+                return
+
+            # action == "acc_password"
+            username = context.user_data.get("new_acc_username")
+            chat_id = update.effective_chat.id
+            clear_pending(context)
+            if not username:
+                await update.message.reply_text(M["cancelled"], reply_markup=admin_menu())
+                return
+            acc_id = await asyncio.to_thread(db_add_account, username, text)
+            try:  # remove the message that contains the password from the chat
+                await update.message.delete()
+            except Exception:
+                pass
+            await show_account(context.bot, chat_id, acc_id, prefix=M["acc_created"])
+            return
+
         if action == "check_user":
             row = await asyncio.to_thread(db_find_user, text)
             if not row:
@@ -529,7 +837,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message, ok = await do_redeem(text.upper(), user)
         if ok:
             clear_pending(context)
-            await update.message.reply_text(message, reply_markup=main_menu(user.id))
+            await update.message.reply_text(
+                message, parse_mode=ParseMode.HTML, reply_markup=main_menu(user.id)
+            )
         else:
             await update.message.reply_text(
                 message + M["retry_code"], reply_markup=cancel_menu()
@@ -544,7 +854,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/gen [days] [count]   e.g. /gen   /gen 30 5"""
+    """/gen [days] [count] - plain codes with no username/password attached."""
     try:
         days = int(context.args[0]) if len(context.args) > 0 else DEFAULT_DAYS
         count = int(context.args[1]) if len(context.args) > 1 else 1
@@ -568,7 +878,9 @@ async def codes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text(M["no_codes"])
         return
-    body = "\n".join(f"<code>{c}</code> ({d} ថ្ងៃ)" for c, d in rows)
+    body = "\n".join(
+        f"<code>{c}</code> ({d} ថ្ងៃ{' · ' + esc(a) if a else ''})" for c, d, a in rows
+    )
     await update.message.reply_text(
         M["codes_list"].format(n=len(rows), body=body), parse_mode=ParseMode.HTML
     )
