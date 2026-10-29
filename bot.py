@@ -149,6 +149,32 @@ def db_revoke(code: str) -> bool:
         return cur.rowcount > 0
 
 
+
+def db_stats():
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        active = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE expires_at > %s", (now,)
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        unused = conn.execute(
+            "SELECT COUNT(*) FROM codes WHERE redeemed_by IS NULL"
+        ).fetchone()[0]
+    return active, total, unused
+
+
+def db_find_user(query: str):
+    """Find a user by Telegram ID or @username. Returns (id, username, expiry)."""
+    q = query.strip().lstrip("@")
+    uid = int(q) if q.isdigit() else None
+    with connect() as conn:
+        return conn.execute(
+            "SELECT user_id, username, expires_at FROM users "
+            "WHERE user_id = %s OR LOWER(username) = LOWER(%s)",
+            (uid, q),
+        ).fetchone()
+
+
 # ---------------------------------------------------------------- helpers
 def fmt_remaining(expiry: datetime) -> str:
     delta = expiry - datetime.now(timezone.utc)
@@ -192,14 +218,33 @@ def active_only(func):
     return wrapper
 
 
-# --------------------------------------------------------- user commands
-def main_menu() -> InlineKeyboardMarkup:
+# ------------------------------------------------------------------ menus
+def main_menu(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("👤 Account", callback_data="account"),
+            InlineKeyboardButton("🔑 Activate", callback_data="activate"),
+        ]
+    ]
+    if user_id in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("👤 Account", callback_data="account"),
-                InlineKeyboardButton("🔑 Activate", callback_data="activate"),
-            ]
+                InlineKeyboardButton("➕ 7 days", callback_data="adm_gen_7"),
+                InlineKeyboardButton("➕ 30 days", callback_data="adm_gen_30"),
+                InlineKeyboardButton("➕ 90 days", callback_data="adm_gen_90"),
+            ],
+            [
+                InlineKeyboardButton("📋 Unused codes", callback_data="adm_codes"),
+                InlineKeyboardButton("🔍 Check user", callback_data="adm_user"),
+            ],
+            [InlineKeyboardButton("🗑 Revoke code", callback_data="adm_revoke")],
+            [InlineKeyboardButton("⬅ Back", callback_data="back")],
         ]
     )
 
@@ -207,6 +252,22 @@ def main_menu() -> InlineKeyboardMarkup:
 def cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("✖ Cancel", callback_data="cancel")]]
+    )
+
+
+def clear_pending(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting_code", None)
+    context.user_data.pop("admin_action", None)
+
+
+async def admin_panel_text() -> str:
+    active, total, unused = await asyncio.to_thread(db_stats)
+    return (
+        "🛠 Admin Panel\n"
+        f"Active users: {active}\n"
+        f"Total users: {total}\n"
+        f"Unused codes: {unused}\n\n"
+        "Pick an action:"
     )
 
 
@@ -241,48 +302,13 @@ async def do_redeem(code: str, user) -> tuple[str, bool]:
     )
 
 
+# --------------------------------------------------------- user commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("awaiting_code", None)
+    clear_pending(context)
     await update.message.reply_text(
-        "Welcome! Choose an option:", reply_markup=main_menu()
+        "Welcome! Choose an option:",
+        reply_markup=main_menu(update.effective_user.id),
     )
-
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-
-    if query.data == "account":
-        context.user_data.pop("awaiting_code", None)
-        await query.message.reply_text(
-            await account_text(user), reply_markup=main_menu()
-        )
-    elif query.data == "activate":
-        context.user_data["awaiting_code"] = True
-        await query.message.reply_text(
-            "Please send your activation code now.\nExample: SK-XXXX-XXXX-XXXX",
-            reply_markup=cancel_menu(),
-        )
-    elif query.data == "cancel":
-        context.user_data.pop("awaiting_code", None)
-        await query.message.reply_text("Cancelled.", reply_markup=main_menu())
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catches the code after the user pressed the Activate button."""
-    if not context.user_data.get("awaiting_code"):
-        return
-    code = update.message.text.strip().upper()
-    message, ok = await do_redeem(code, update.effective_user)
-    if ok:
-        context.user_data.pop("awaiting_code", None)
-        await update.message.reply_text(message, reply_markup=main_menu())
-    else:
-        await update.message.reply_text(
-            message + "\nSend the code again, or press Cancel.",
-            reply_markup=cancel_menu(),
-        )
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,7 +321,9 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     code = context.args[0].strip().upper()
     message, _ = await do_redeem(code, update.effective_user)
-    await update.message.reply_text(message, reply_markup=main_menu())
+    await update.message.reply_text(
+        message, reply_markup=main_menu(update.effective_user.id)
+    )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,7 +348,132 @@ async def vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("You have an active subscription. Welcome in!")
 
 
+# -------------------------------------------------------- button handling
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    data = query.data
+    msg = query.message
+
+    # ---- admin buttons (always re-check the user is an admin)
+    if data == "admin" or data.startswith("adm_"):
+        if user.id not in ADMIN_IDS:
+            await msg.reply_text("Admins only.")
+            return
+        clear_pending(context)
+
+        if data == "admin":
+            await msg.reply_text(await admin_panel_text(), reply_markup=admin_menu())
+
+        elif data.startswith("adm_gen_"):
+            days = int(data.rsplit("_", 1)[1])
+            codes = await asyncio.to_thread(db_generate, user.id, days, 1)
+            await msg.reply_text(
+                f"New {days}-day code:\n\n<code>{codes[0]}</code>\n\n"
+                "Tap the code to copy it, then send it to the user.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_menu(),
+            )
+
+        elif data == "adm_codes":
+            rows = await asyncio.to_thread(db_unused_codes)
+            if not rows:
+                text, mode = "No unused codes.", None
+            else:
+                body = "\n".join(f"<code>{c}</code> ({d}d)" for c, d in rows)
+                text, mode = f"Unused codes ({len(rows)}):\n\n{body}", ParseMode.HTML
+            await msg.reply_text(text, parse_mode=mode, reply_markup=admin_menu())
+
+        elif data == "adm_user":
+            context.user_data["admin_action"] = "check_user"
+            await msg.reply_text(
+                "Send the user's Telegram ID or @username.",
+                reply_markup=cancel_menu(),
+            )
+
+        elif data == "adm_revoke":
+            context.user_data["admin_action"] = "revoke"
+            await msg.reply_text(
+                "Send the code you want to revoke (SK-XXXX-XXXX-XXXX).",
+                reply_markup=cancel_menu(),
+            )
+        return
+
+    # ---- normal user buttons
+    if data == "account":
+        clear_pending(context)
+        await msg.reply_text(await account_text(user), reply_markup=main_menu(user.id))
+    elif data == "activate":
+        clear_pending(context)
+        context.user_data["awaiting_code"] = True
+        await msg.reply_text(
+            "Please send your activation code now.\nExample: SK-XXXX-XXXX-XXXX",
+            reply_markup=cancel_menu(),
+        )
+    elif data == "back":
+        clear_pending(context)
+        await msg.reply_text("Choose an option:", reply_markup=main_menu(user.id))
+    elif data == "cancel":
+        clear_pending(context)
+        await msg.reply_text("Cancelled.", reply_markup=main_menu(user.id))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text sent after pressing Activate or an admin input button."""
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    # ---- admin inputs
+    action = context.user_data.get("admin_action")
+    if action and user.id in ADMIN_IDS:
+        if action == "check_user":
+            row = await asyncio.to_thread(db_find_user, text)
+            if not row:
+                await update.message.reply_text(
+                    "No user found. Send another ID / @username, or press Cancel.",
+                    reply_markup=cancel_menu(),
+                )
+                return
+            uid, uname, expiry = row
+            state = (
+                f"Active\nExpires: {fmt_date(expiry)}\nRemaining: {fmt_remaining(expiry)}"
+                if expiry > datetime.now(timezone.utc)
+                else f"Expired on {fmt_date(expiry)}"
+            )
+            clear_pending(context)
+            await update.message.reply_text(
+                f"👤 User\nID: {uid}\nUsername: {'@' + uname if uname else '-'}\n{state}",
+                reply_markup=admin_menu(),
+            )
+        elif action == "revoke":
+            ok = await asyncio.to_thread(db_revoke, text.upper())
+            clear_pending(context)
+            await update.message.reply_text(
+                "Code revoked." if ok else "Code not found or already used.",
+                reply_markup=admin_menu(),
+            )
+        return
+
+    # ---- activation code
+    if context.user_data.get("awaiting_code"):
+        message, ok = await do_redeem(text.upper(), user)
+        if ok:
+            clear_pending(context)
+            await update.message.reply_text(message, reply_markup=main_menu(user.id))
+        else:
+            await update.message.reply_text(
+                message + "\nSend the code again, or press Cancel.",
+                reply_markup=cancel_menu(),
+            )
+
+
 # -------------------------------------------------------- admin commands
+@admin_only
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await admin_panel_text(), reply_markup=admin_menu())
+
+
 @admin_only
 async def gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/gen [days] [count]   e.g. /gen   /gen 30 5"""
@@ -395,6 +548,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("redeem", redeem))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("vip", vip))
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("gen", gen))
     app.add_handler(CommandHandler("codes", codes_cmd))
     app.add_handler(CommandHandler("revoke", revoke))
